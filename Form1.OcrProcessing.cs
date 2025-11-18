@@ -545,7 +545,8 @@ namespace ImageJudgement2
                     Debug.WriteLine($"[OCR TEST] 無効な抽出領域が計算されました: {rectangle}");
                     if (isTest)
                         MessageBox.Show("抽出領域が不正です。OCR結果に基づく矩形が見つからなかった可能性があります。", "OCRテスト結果", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return false;
+                    
+                    return true;
                 }
 
                 Debug.WriteLine($"[OCR TEST] 抽出領域: {rectangle}");
