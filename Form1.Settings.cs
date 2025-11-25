@@ -602,10 +602,299 @@ namespace ImageJudgement2
 
                 settingsLoaded = true;
                 Debug.WriteLine("設定の読み込みが完了しました。");
+
+                // 最後に選択したパスがある場合、起動時にそのフォルダを開く
+                if (!string.IsNullOrEmpty(lastSelectedPath) && treeBrowser != null)
+                {
+                    // 相対パスの階層数をチェック
+                    string? topLevelFolder = topLevelFolders.FirstOrDefault(f =>
+                        lastSelectedPath.StartsWith(f, StringComparison.OrdinalIgnoreCase));
+
+                    if (topLevelFolder != null)
+                    {
+                        string relativePath = lastSelectedPath.Substring(topLevelFolder.Length)
+                            .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                        if (!string.IsNullOrEmpty(relativePath))
+                        {
+                            var parts = relativePath.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                                                          StringSplitOptions.RemoveEmptyEntries);
+
+                            // 階層が深い場合（3階層以上）は進捗ダイアログを表示
+                            if (parts.Length >= 3)
+                            {
+                                Debug.WriteLine($"[RestorePath] 深い階層 ({parts.Length}階層) の復元を開始します");
+
+                                this.Load += async (s, e) =>
+                                {
+                                    // 少し待ってからダイアログを表示（フォームが完全に表示された後）
+                                    await Task.Delay(100);
+
+                                    // 進捗ダイアログを表示
+                                    var progressDialog = new FolderRestoreProgressDialog();
+                                    progressDialog.Show(this);
+                                    progressDialog.UpdateDetail($"{parts.Length} 階層のフォルダを展開しています...");
+
+                                    try
+                                    {
+                                        // 復元処理を実行（進捗ダイアログを渡す）
+                                        await RestoreLastSelectedPathAsync(progressDialog, parts.Length);
+
+                                        // 完了メッセージを表示
+                                        progressDialog.SetCompleted();
+                                        await Task.Delay(500); // 完了メッセージを見せる
+                                        progressDialog.CloseDialog();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Debug.WriteLine($"[RestorePath] 復元エラー: {ex.Message}");
+                                        progressDialog.SetError(ex.Message);
+                                        await Task.Delay(2000); // エラーメッセージを見せる
+                                        progressDialog.CloseDialog();
+                                    }
+                                };
+                            }
+                            else
+                            {
+                                // 浅い階層の場合は通常通り（ダイアログなし）
+                                this.Load += async (s, e) => await RestoreLastSelectedPathAsync();
+                            }
+                        }
+                        else
+                        {
+                            // トップレベルフォルダ自体の場合
+                            this.Load += async (s, e) => await RestoreLastSelectedPathAsync();
+                        }
+                    }
+                    else
+                    {
+                        // トップレベルフォルダが見つからない場合
+                        this.Load += async (s, e) => await RestoreLastSelectedPathAsync();
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"LoadAppSettings failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// 最後に選択したパスを復元
+        /// </summary>
+        private async Task RestoreLastSelectedPathAsync()
+        {
+            await RestoreLastSelectedPathAsync(null, 0);
+        }
+
+        /// <summary>
+        /// 最後に選択したパスを復元（進捗ダイアログ付き）
+        /// </summary>
+        private async Task RestoreLastSelectedPathAsync(FolderRestoreProgressDialog? progressDialog, int totalDepth)
+        {
+            if (string.IsNullOrEmpty(lastSelectedPath) || treeBrowser == null)
+            {
+                Debug.WriteLine($"[RestorePath] 早期リターン: lastSelectedPath={lastSelectedPath}, treeBrowser={treeBrowser != null}");
+                return;
+            }
+
+            try
+            {
+                Debug.WriteLine($"[RestorePath] ========== 開始 ==========");
+                Debug.WriteLine($"[RestorePath] 復元するパス: {lastSelectedPath}");
+
+                // パスが存在するか確認
+                if (!Directory.Exists(lastSelectedPath))
+                {
+                    Debug.WriteLine($"[RestorePath] パスが存在しません: {lastSelectedPath}");
+                    progressDialog?.UpdateProgress("指定されたフォルダが見つかりません");
+                    return;
+                }
+
+                // トップレベルフォルダを見つける
+                string? topLevelFolder = null;
+                foreach (var folder in topLevelFolders)
+                {
+                    if (lastSelectedPath.StartsWith(folder, StringComparison.OrdinalIgnoreCase))
+                    {
+                        topLevelFolder = folder;
+                        break;
+                    }
+                }
+
+                if (topLevelFolder == null)
+                {
+                    Debug.WriteLine($"[RestorePath] トップレベルフォルダが見つかりません");
+                    progressDialog?.UpdateProgress("ルートフォルダが見つかりません");
+                    return;
+                }
+
+                Debug.WriteLine($"[RestorePath] トップレベルフォルダ: {topLevelFolder}");
+
+                // トップレベルフォルダ以下のパスを取得
+                string relativePath = lastSelectedPath.Substring(topLevelFolder.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                Debug.WriteLine($"[RestorePath] 相対パス: {relativePath}");
+
+                // トップレベルノードを探す
+                TreeNode? currentNode = null;
+                this.Invoke(() =>
+                {
+                    foreach (TreeNode node in treeBrowser.Nodes)
+                    {
+                        string? nodeTag = node.Tag as string;
+                        Debug.WriteLine($"[RestorePath] ノードチェック: Text={node.Text}, Tag={nodeTag}");
+                        if (nodeTag != null && nodeTag.Equals(topLevelFolder, StringComparison.OrdinalIgnoreCase))
+                        {
+                            currentNode = node;
+                            Debug.WriteLine($"[RestorePath] トップレベルノード発見: {node.Text}");
+                            break;
+                        }
+                    }
+                });
+
+                if (currentNode == null)
+                {
+                    Debug.WriteLine($"[RestorePath] トップレベルノードが見つかりません");
+                    progressDialog?.UpdateProgress("ツリーノードが見つかりません");
+                    return;
+                }
+
+                // パスを展開
+                if (!string.IsNullOrEmpty(relativePath))
+                {
+                    var parts = relativePath.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                                                   StringSplitOptions.RemoveEmptyEntries);
+                    Debug.WriteLine($"[RestorePath] パス階層数: {parts.Length}");
+
+                    string accumulatedPath = topLevelFolder;
+
+                    for (int depth = 0; depth < parts.Length; depth++)
+                    {
+                        string part = parts[depth];
+                        accumulatedPath = Path.Combine(accumulatedPath, part);
+                        Debug.WriteLine($"[RestorePath] [{depth + 1}/{parts.Length}] 展開試行: {accumulatedPath}");
+
+                        // 進捗ダイアログを更新
+                        progressDialog?.UpdateProgress($"{depth + 1}/{parts.Length} フォルダを展開中: {part}");
+                        progressDialog?.UpdateProgressBar(depth + 1, parts.Length);
+
+                        // ノードの展開状態をUIスレッドでチェック
+                        bool hasChildren = false;
+                        bool hasDummyNode = false;
+                        int nodeCount = 0;
+
+                        this.Invoke(() =>
+                        {
+                            nodeCount = currentNode.Nodes.Count;
+                            hasChildren = nodeCount > 0;
+                            if (hasChildren)
+                            {
+                                var firstNode = currentNode.Nodes[0];
+                                hasDummyNode = firstNode.Tag == null && string.IsNullOrEmpty(firstNode.Text);
+                                Debug.WriteLine($"[RestorePath] ノード状態: Count={nodeCount}, HasDummy={hasDummyNode}");
+                            }
+                            else
+                            {
+                                Debug.WriteLine($"[RestorePath] ノード状態: 子ノードなし");
+                            }
+                        });
+
+                        // ダミーノードがある場合は展開が必要
+                        if (hasDummyNode)
+                        {
+                            Debug.WriteLine($"[RestorePath] ダミーノード検出 → ExpandNodeAsync 呼び出し");
+                            progressDialog?.UpdateDetail($"サブフォルダを読み込んでいます... ({part})");
+
+                            // ExpandNodeAsync を直接呼び出す
+                            await ExpandNodeAsync(currentNode);
+
+                            Debug.WriteLine($"[RestorePath] ExpandNodeAsync 完了 → 200ms待機");
+                            await Task.Delay(200);
+
+                            // 展開後の状態を確認
+                            this.Invoke(() =>
+                            {
+                                Debug.WriteLine($"[RestorePath] 展開後の子ノード数: {currentNode.Nodes.Count}");
+                            });
+                        }
+                        else if (hasChildren)
+                        {
+                            // 既に子ノードがある場合は単純に展開
+                            this.Invoke(() =>
+                            {
+                                if (!currentNode.IsExpanded)
+                                {
+                                    Debug.WriteLine($"[RestorePath] ノードを展開（Expand()）");
+                                    currentNode.Expand();
+                                }
+                                else
+                                {
+                                    Debug.WriteLine($"[RestorePath] ノードは既に展開済み");
+                                }
+                            });
+                            await Task.Delay(100);
+                        }
+
+                        // 次のノードを探す（UIスレッドで）
+                        TreeNode? nextNode = null;
+                        string targetPath = accumulatedPath; // ローカル変数にコピー
+
+                        this.Invoke(() =>
+                        {
+                            Debug.WriteLine($"[RestorePath] 子ノードを検索: {targetPath}");
+
+                            foreach (TreeNode childNode in currentNode.Nodes)
+                            {
+                                string? childPath = childNode.Tag as string;
+
+                                if (childPath != null &&
+                                    childPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    nextNode = childNode;
+                                    Debug.WriteLine($"[RestorePath] ✓ 次のノード発見: {childNode.Text}");
+                                    break;
+                                }
+                            }
+
+                            if (nextNode == null)
+                            {
+                                Debug.WriteLine($"[RestorePath] ✗ 次のノードが見つかりません");
+                            }
+                        });
+
+                        if (nextNode == null)
+                        {
+                            Debug.WriteLine($"[RestorePath] 中断: 子ノードが見つからない ({accumulatedPath})");
+                            progressDialog?.UpdateProgress($"フォルダが見つかりません: {part}");
+                            break;
+                        }
+
+                        currentNode = nextNode;
+                        Debug.WriteLine($"[RestorePath] 次の階層へ移動: {currentNode.Text}");
+                    }
+                }
+
+                // 最終的なノードを選択（UIスレッドで）
+                if (currentNode != null)
+                {
+                    this.Invoke(() =>
+                    {
+                        treeBrowser.SelectedNode = currentNode;
+                        currentNode.EnsureVisible();
+                        Debug.WriteLine($"[RestorePath] ✓ 最終ノード選択完了: {currentNode.Text}");
+                    });
+
+                    progressDialog?.UpdateProgress("フォルダの選択が完了しました");
+                }
+
+                Debug.WriteLine($"[RestorePath] ========== 完了 ==========");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[RestorePath] ✗ エラー: {ex}");
+                Debug.WriteLine($"[RestorePath] スタックトレース: {ex.StackTrace}");
+                progressDialog?.SetError(ex.Message);
+                throw;
             }
         }
 
@@ -737,13 +1026,11 @@ namespace ImageJudgement2
         private DatabaseHelper? CreateDatabaseHelper()
         {
             // データベース機能は現在使用しないため無効化
-            Debug.WriteLine("データベース接続は無効化されています。");
-            return null;
+            //Debug.WriteLine("データベース接続は無効化されています。");
+            //return null;
 
-            /* データベース接続が必要な場合は以下のコメントを解除
-            if (string.IsNullOrWhiteSpace(dbServer) ||
-           string.IsNullOrWhiteSpace(dbName) ||
-           string.IsNullOrWhiteSpace(dbUserId))
+            //データベース接続が必要な場合は以下のコメントを解除
+            if (string.IsNullOrWhiteSpace(dbServer) || string.IsNullOrWhiteSpace(dbName) || string.IsNullOrWhiteSpace(dbUserId))
             {
                 Debug.WriteLine("データベース接続情報が設定されていません。");
                 return null;
@@ -758,7 +1045,6 @@ namespace ImageJudgement2
                 Debug.WriteLine($"DatabaseHelper作成エラー: {ex.Message}");
                 return null;
             }
-            */
         }
 
         /// <summary>

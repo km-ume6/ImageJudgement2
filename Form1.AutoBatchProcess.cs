@@ -179,6 +179,10 @@ namespace ImageJudgement2
                     int successCount = 0;
                     int failureCount = 0;
                     
+                    // OK/NG判定数のカウントを追加
+                    int okCount = 0;
+                    int ngCount = 0;
+                    
                     // 正解率計算用の変数を追加
                     var statistics = JudgementEvaluator.CreateStatistics();
 
@@ -290,6 +294,16 @@ namespace ImageJudgement2
                             {
                                 successCount++;
                                 
+                                // OK/NG判定数をカウント
+                                if (result.JudgeResult?.Equals("OK", StringComparison.OrdinalIgnoreCase) == true)
+                                {
+                                    okCount++;
+                                }
+                                else if (result.JudgeResult?.Equals("NG", StringComparison.OrdinalIgnoreCase) == true)
+                                {
+                                    ngCount++;
+                                }
+                                
                                 // JudgementEvaluatorを使用して正解ラベルを抽出
                                 string? groundTruth = JudgementEvaluator.ExtractGroundTruthFromPath(imageFile);
                                 
@@ -318,11 +332,14 @@ namespace ImageJudgement2
                             else
                             {
                                 failureCount++;
+                                ngCount++; // NG判定カウント
                                 
+
                                 // エラーの場合も統計情報に追加
                                 string? groundTruth = JudgementEvaluator.ExtractGroundTruthFromPath(imageFile);
                                 statistics.AddResult(null, groundTruth, true);
                                 
+
                                 SafeInvoke(() =>
                                 {
                                     progressDialog.AddLog($"  ✗ 判定失敗");
@@ -397,6 +414,8 @@ namespace ImageJudgement2
                         progressDialog.AddLog($"  成功: {successCount} 件");
                         progressDialog.AddLog($"  失敗: {failureCount} 件");
                         progressDialog.AddLog($"  合計: {successCount + failureCount} 件");
+                        progressDialog.AddLog($"  OK判定: {okCount} 件");
+                        progressDialog.AddLog($"  NG判定: {ngCount} 件");
                         
                         // 正解率情報を追加
                         if (statistics.LabeledCount > 0)
@@ -444,6 +463,17 @@ namespace ImageJudgement2
         /// </summary>
         private async Task<ImageProcessResult> ProcessSingleImageWithDetailsAsync(string imageFilePath, AutoBatchProcessDialog progressDialog)
         {
+            return await ProcessSingleImageWithDetailsAsync(imageFilePath, progressDialog, null);
+        }
+
+        /// <summary>
+        /// 単一画像を処理（詳細情報付き、キャッシュ対応）
+        /// </summary>
+        private async Task<ImageProcessResult> ProcessSingleImageWithDetailsAsync(
+            string imageFilePath, 
+            AutoBatchProcessDialog progressDialog,
+            Dictionary<string, AiModelResult>? aiResultCache)
+        {
             var result = new ImageProcessResult();
 
             // 停止フラグをチェックするヘルパーメソッド
@@ -471,6 +501,61 @@ namespace ImageJudgement2
                 if (CheckStopped())
                 {
                     result.ErrorMessage = "処理が中断されました";
+                    return result;
+                }
+
+                // キャッシュがある場合はチェック
+                if (aiResultCache != null && aiResultCache.TryGetValue(imageFilePath, out var cachedAiResult))
+                {
+                    progressDialog.AddLog($"  キャッシュから取得...");
+                    
+                    // メイン画面の更新（画像の選択）
+                    bool cacheSelectionChanged = false;
+                    this.Invoke(() =>
+                    {
+                        if (imageListView != null)
+                        {
+                            foreach (ListViewItem item in imageListView.Items)
+                            {
+                                string? itemPath = item.Tag as string;
+                                if (itemPath == imageFilePath)
+                                {
+                                    imageListView.SelectedItems.Clear();
+                                    item.Selected = true;
+                                    item.EnsureVisible();
+                                    cacheSelectionChanged = true;
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    
+                    // 画像読み込みの待機時間を短縮（キャッシュ時は既に読み込み済みのため）
+                    if (cacheSelectionChanged)
+                    {
+                        await Task.Delay(100); // UI更新の時間を確保（短縮版）
+                    }
+                    
+                    // 現在の判定モードで判定結果を再計算
+                    JudgeMode currentMode = detectionMode;
+                    string? judgeResult = cachedAiResult.Judge(currentMode);
+
+                    if (!string.IsNullOrEmpty(judgeResult))
+                    {
+                        result.Success = true;
+                        result.JudgeResult = judgeResult;
+
+                        if (cachedAiResult.TopClassResult != null)
+                        {
+                            result.CategoryName = cachedAiResult.TopClassResult.CategoryName;
+                            result.Score = cachedAiResult.TopClassResult.Score;
+                        }
+                    }
+                    else
+                    {
+                        result.ErrorMessage = "キャッシュされた判定結果を取得できませんでした";
+                    }
+
                     return result;
                 }
 
@@ -586,23 +671,42 @@ namespace ImageJudgement2
                     return result;
                 }
 
-                // 結果を取得
+                // 結果を取得してキャッシュに保存
                 this.Invoke(() =>
                 {
-                    if (currentAiResult != null && cachedJudgeResult != null)
+                    if (currentAiResult != null)
                     {
-                        result.Success = true;
-                        result.JudgeResult = cachedJudgeResult;
-
-                        if (currentAiResult.TopClassResult != null)
+                        // 現在の判定モードで判定結果を計算
+                        JudgeMode currentMode = detectionMode;
+                        string? judgeResult = currentAiResult.Judge(currentMode);
+                        
+                        if (!string.IsNullOrEmpty(judgeResult))
                         {
-                            result.CategoryName = currentAiResult.TopClassResult.CategoryName;
-                            result.Score = currentAiResult.TopClassResult.Score;
+                            result.Success = true;
+                            result.JudgeResult = judgeResult;
+
+                            if (currentAiResult.TopClassResult != null)
+                            {
+                                result.CategoryName = currentAiResult.TopClassResult.CategoryName;
+                                result.Score = currentAiResult.TopClassResult.Score;
+                            }
+
+                            // AI判定結果（AiModelResult）をキャッシュに保存
+                            // 判定結果（OK/NG）ではなく、生のAI結果を保存することで
+                            // 異なる判定モードで再利用可能
+                            if (aiResultCache != null)
+                            {
+                                aiResultCache[imageFilePath] = currentAiResult;
+                            }
+                        }
+                        else
+                        {
+                            result.ErrorMessage = "AI判定結果を取得できませんでした";
                         }
                     }
                     else
                     {
-                        result.ErrorMessage = "AI判定結果を取得できませんでした";
+                        result.ErrorMessage = "AI判定結果がnullです";
                     }
                 });
 
@@ -684,9 +788,9 @@ namespace ImageJudgement2
             }
 
             // 画像ファイルを取得
-            var imageFiles = GetImageFilesInDirectory(selectedFolderPath);
+            var allImageFiles = GetImageFilesInDirectory(selectedFolderPath);
 
-            if (imageFiles.Count == 0)
+            if (allImageFiles.Count == 0)
             {
                 MessageBox.Show(
                     "選択されたフォルダに画像ファイルがありません。",
@@ -696,34 +800,49 @@ namespace ImageJudgement2
                 return;
             }
 
-            // 確認ダイアログ
-            var confirmResult = MessageBox.Show(
-                $"選択されたフォルダ内の {imageFiles.Count} 個の画像ファイルに対して\n全判定モード（3種類）で判定を実行し、精度を比較します。\n\nよろしいですか？",
-                "確認",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question);
-
-            if (confirmResult != DialogResult.Yes)
-            {
-                return;
-            }
-
-            // 待ち時間を設定（デフォルト500ms）
+            // 処理件数と待ち時間を設定
+            int imageCount = Math.Min(10, allImageFiles.Count); // デフォルト10件
             int delayMilliseconds = 500;
-            using var delayDialog = new Form
+            
+            using var settingsDialog = new Form
             {
-                Text = "待ち時間設定",
-                Size = new System.Drawing.Size(350, 160),
+                Text = "判定モード比較設定",
+                Size = new System.Drawing.Size(400, 260),
                 StartPosition = FormStartPosition.CenterParent,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
                 MinimizeBox = false
             };
 
+            var lblInfo = new Label
+            {
+                Text = $"フォルダ内の画像ファイル数: {allImageFiles.Count} 件",
+                Location = new System.Drawing.Point(20, 20),
+                Size = new System.Drawing.Size(350, 20),
+                Font = new Font(SystemFonts.DefaultFont.FontFamily, 9, FontStyle.Bold)
+            };
+
+            var lblImageCount = new Label
+            {
+                Text = "処理する画像の件数:",
+                Location = new System.Drawing.Point(20, 50),
+                Size = new System.Drawing.Size(200, 20)
+            };
+
+            var nudImageCount = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = allImageFiles.Count,
+                Value = imageCount,
+                Increment = 1,
+                Location = new System.Drawing.Point(20, 75),
+                Size = new System.Drawing.Size(350, 25)
+            };
+
             var lblDelay = new Label
             {
                 Text = "各判定後の待ち時間 (ミリ秒):",
-                Location = new System.Drawing.Point(20, 20),
+                Location = new System.Drawing.Point(20, 110),
                 Size = new System.Drawing.Size(300, 20)
             };
 
@@ -733,15 +852,15 @@ namespace ImageJudgement2
                 Maximum = 60000,
                 Value = delayMilliseconds,
                 Increment = 100,
-                Location = new System.Drawing.Point(20, 45),
-                Size = new System.Drawing.Size(300, 25)
+                Location = new System.Drawing.Point(20, 135),
+                Size = new System.Drawing.Size(350, 25)
             };
 
             var btnOk = new Button
             {
                 Text = "OK",
                 DialogResult = DialogResult.OK,
-                Location = new System.Drawing.Point(130, 75),
+                Location = new System.Drawing.Point(180, 170),
                 Size = new System.Drawing.Size(80, 30)
             };
 
@@ -749,22 +868,41 @@ namespace ImageJudgement2
             {
                 Text = "キャンセル",
                 DialogResult = DialogResult.Cancel,
-                Location = new System.Drawing.Point(220, 75),
+                Location = new System.Drawing.Point(270, 170),
                 Size = new System.Drawing.Size(100, 30)
             };
 
-            delayDialog.Controls.Add(lblDelay);
-            delayDialog.Controls.Add(nudDelay);
-            delayDialog.Controls.Add(btnOk);
-            delayDialog.Controls.Add(btnCancel);
-            delayDialog.AcceptButton = btnOk;
-            delayDialog.CancelButton = btnCancel;
+            settingsDialog.Controls.Add(lblInfo);
+            settingsDialog.Controls.Add(lblImageCount);
+            settingsDialog.Controls.Add(nudImageCount);
+            settingsDialog.Controls.Add(lblDelay);
+            settingsDialog.Controls.Add(nudDelay);
+            settingsDialog.Controls.Add(btnOk);
+            settingsDialog.Controls.Add(btnCancel);
+            settingsDialog.AcceptButton = btnOk;
+            settingsDialog.CancelButton = btnCancel;
 
-            if (delayDialog.ShowDialog(this) == DialogResult.OK)
+            if (settingsDialog.ShowDialog(this) == DialogResult.OK)
             {
+                imageCount = (int)nudImageCount.Value;
                 delayMilliseconds = (int)nudDelay.Value;
             }
             else
+            {
+                return;
+            }
+
+            // 指定件数分の画像ファイルを取得
+            var imageFiles = allImageFiles.Take(imageCount).ToList();
+
+            // 確認ダイアログ
+            var confirmResult = MessageBox.Show(
+                $"最初の {imageFiles.Count} 個の画像ファイルに対して\n全判定モード（3種類）で判定を実行し、精度を比較します。\n\nよろしいですか？",
+                "確認",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (confirmResult != DialogResult.Yes)
             {
                 return;
             }
@@ -780,6 +918,9 @@ namespace ImageJudgement2
         {
             var progressDialog = new AutoBatchProcessDialog();
             Task? processingTask = null;
+
+            // AI判定結果のキャッシュ（画像パス → 判定結果）
+            var aiResultCache = new Dictionary<string, AiModelResult>();
 
             void SafeInvoke(Action action)
             {
@@ -799,6 +940,7 @@ namespace ImageJudgement2
                 catch { }
             }
 
+            // Show 時に処理を開始
             void StartProcessing(object? sender, EventArgs e)
             {
                 progressDialog.Shown -= StartProcessing;
@@ -832,8 +974,9 @@ namespace ImageJudgement2
                         SafeInvoke(() => stopped = progressDialog.IsStopped);
                         if (stopped) break;
 
-                        // 判定モードを切り替え
-                        detectionMode = mode;
+                        // 判定モードを切り替え（UIスレッドで安全に変更）
+                        SafeInvoke(() => detectionMode = mode);
+                        
                         string modeText = GetJudgeModeDisplayName(mode);
 
                         var statistics = JudgementEvaluator.CreateStatistics();
@@ -876,12 +1019,28 @@ namespace ImageJudgement2
                                 // JudgementEvaluatorを使用して正解ラベルを抽出
                                 string? groundTruth = JudgementEvaluator.ExtractGroundTruthFromPath(imageFile);
 
-                                var result = await ProcessSingleImageWithDetailsAsync(imageFile, progressDialog).ConfigureAwait(false);
+                                // キャッシュを渡して処理
+                                var result = await ProcessSingleImageWithDetailsAsync(imageFile, progressDialog, aiResultCache).ConfigureAwait(false);
+
+                                // キャッシュから取得した場合でも、aiResultCacheに存在する
+                                AiModelResult? aiResultForReason = null;
+                                lock (aiResultCache)
+                                {
+                                    if (aiResultCache.TryGetValue(imageFile, out var cachedAiResult))
+                                    {
+                                        aiResultForReason = cachedAiResult;
+                                    }
+                                }
 
                                 if (result.Success && !string.IsNullOrEmpty(result.JudgeResult))
                                 {
                                     // 統計情報に結果を追加
                                     statistics.AddResult(result.JudgeResult, groundTruth, false);
+
+                                    // 判定根拠を取得（現在のモードを明示的に渡す）
+                                    string judgementReason = aiResultForReason != null 
+                                        ? GetJudgementReason(aiResultForReason, mode, result.JudgeResult)
+                                        : string.Empty;
 
                                     // JudgementEvaluatorを使用してログメッセージを生成
                                     string logMessage = JudgementEvaluator.FormatJudgementLog(
@@ -894,6 +1053,13 @@ namespace ImageJudgement2
                                     SafeInvoke(() =>
                                     {
                                         progressDialog.AddLog($"  [{i + 1}/{imageFiles.Count}] {logMessage}");
+                                        
+                                        // 判定根拠を表示（TopClass以外）
+                                        if (!string.IsNullOrEmpty(judgementReason))
+                                        {
+                                            progressDialog.AddLog($"      {judgementReason}");
+                                        }
+                                        
                                         // リアルタイムで正解率を更新
                                         progressDialog.UpdateAccuracy(statistics.CorrectCount, statistics.LabeledCount);
                                     });
@@ -944,8 +1110,8 @@ namespace ImageJudgement2
 
                     }
 
-                    // 元の判定モードに戻す
-                    detectionMode = originalMode;
+                    // 元の判定モードに戻す（UIスレッドで安全に変更）
+                    SafeInvoke(() => detectionMode = originalMode);
 
                     totalStopwatch.Stop();
 
@@ -959,6 +1125,12 @@ namespace ImageJudgement2
                         progressDialog.AddLog("=".PadRight(80, '='));
                         progressDialog.AddLog("判定モード比較レポート");
                         progressDialog.AddLog("=".PadRight(80, '='));
+                        progressDialog.AddLog("");
+                        
+                        // キャッシュ使用統計を表示
+                        progressDialog.AddLog($"【キャッシュ統計】");
+                        progressDialog.AddLog($"  キャッシュ保存数: {aiResultCache.Count} 件");
+                        progressDialog.AddLog($"  サーバー問合せ削減: {(modes.Length - 1) * aiResultCache.Count} 回");
                         progressDialog.AddLog("");
 
                         // 精度でソート（降順）
@@ -1054,6 +1226,63 @@ namespace ImageJudgement2
             public string? CategoryName { get; set; }
             public double Score { get; set; }
             public string? ErrorMessage { get; set; }
+        }
+
+        /// <summary>
+        /// 判定根拠を取得
+        /// </summary>
+        private string GetJudgementReason(AiModelResult aiResult, JudgeMode mode, string judgementResult)
+        {
+            if (aiResult == null || aiResult.AllClassResults == null || aiResult.AllClassResults.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            switch (mode)
+            {
+                case JudgeMode.TopClass:
+                    // TopClassの場合は判定根拠を表示しない（カテゴリ名とスコアで明らか）
+                    return string.Empty;
+
+                case JudgeMode.ScoreAverage:
+                    {
+                        // OK/NGそれぞれのスコア平均を計算
+                        double okSum = 0; int okCount = 0;
+                        double ngSum = 0; int ngCount = 0;
+
+                        foreach (var r in aiResult.AllClassResults)
+                        {
+                            if (string.IsNullOrEmpty(r.CategoryName)) continue;
+                            var name = r.CategoryName.ToUpper();
+                            if (name.Contains("OK")) { okSum += r.Score; okCount++; }
+                            if (name.Contains("NG")) { ngSum += r.Score; ngCount++; }
+                        }
+
+                        double okAvg = okCount > 0 ? okSum / okCount : 0;
+                        double ngAvg = ngCount > 0 ? ngSum / ngCount : 0;
+
+                        return $"根拠: OK平均={okAvg:F4} ({okCount}件), NG平均={ngAvg:F4} ({ngCount}件)";
+                    }
+
+                case JudgeMode.ScoreRanking:
+                    {
+                        // OK/NGそれぞれのランキングスコアを計算
+                        int okScore = aiResult.ComputeOkRankingScore();
+                        int ngScore = aiResult.ComputeNgRankingScore();
+
+                        // 上位カテゴリを表示（上位3件）
+                        var topCategories = aiResult.AllClassResults
+                            .Take(3)
+                            .Select((r, idx) => $"{idx + 1}位:{r.CategoryName}")
+                            .ToList();
+
+                        string topCategoriesText = string.Join(", ", topCategories);
+                        return $"根拠: OKランク合計={okScore}, NGランク合計={ngScore} (上位: {topCategoriesText})";
+                    }
+
+                default:
+                    return string.Empty;
+            }
         }
     }
 }

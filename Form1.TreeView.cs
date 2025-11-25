@@ -164,7 +164,7 @@ namespace ImageJudgement2
             return files.Where(IsImageFile).ToList();
         }
 
-        private void ProcessImageFilesWithProgress(string folderPath, List<string> imageFiles, dynamic db)
+        private void ProcessImageFilesWithProgress(string folderPath, List<string> imageFiles, DatabaseHelper db)
         {
             using var progressForm = CreateProgressForm(imageFiles.Count);
             var progressBar = progressForm.Controls.OfType<ProgressBar>().First();
@@ -233,54 +233,190 @@ namespace ImageJudgement2
             return progressForm;
         }
 
-        private void ProcessSingleImageFile(string folderPath, string file, dynamic db)
+        /// <summary>
+        /// 単一画像ファイルを処理して検出画像を生成
+        /// </summary>
+        /// <param name="folderPath">出力先フォルダパス</param>
+        /// <param name="file">処理対象のファイルパス</param>
+        /// <param name="db">データベースヘルパー</param>
+        private void ProcessSingleImageFile(string folderPath, string file, DatabaseHelper db)
         {
-            var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(file) ?? string.Empty;
+            var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(file);
             if (string.IsNullOrEmpty(fileNameWithoutExtension))
+            {
+                Debug.WriteLine($"[ProcessSingleImageFile] ファイル名が無効: {file}");
                 return;
+            }
 
             var outputPaths = GenerateOutputPaths(folderPath, fileNameWithoutExtension);
-            var searchKey = ExtractSearchKey(fileNameWithoutExtension);
 
-            if (string.IsNullOrEmpty(searchKey))
-                return;
-
-            var dataTable = db.ExecuteQuery(
-                "SELECT フルパス FROM ScreenshotList WHERE フルパス LIKE @param",
-                new Dictionary<string, object> { { "@param", $"%{searchKey}%" } });
-
-            if (dataTable is System.Data.DataTable dt && dt.Rows.Count == 1)
+            // 1. 直接ファイルが存在する場合はそのまま処理
+            if (TryProcessExistingFile(file, outputPaths))
             {
-                var sourceImagePath = dt.Rows[0]["フルパス"]?.ToString() ?? string.Empty;
-                if (!string.IsNullOrEmpty(sourceImagePath))
+                return;
+            }
+
+            // 2. DB検索にフォールバック
+            ProcessFileViaDatabase(file, fileNameWithoutExtension, outputPaths, db);
+        }
+
+        /// <summary>
+        /// 既存ファイルの処理を試行
+        /// </summary>
+        /// <returns>処理成功した場合true</returns>
+        private bool TryProcessExistingFile(string file, (string Composite, string Circle, string Rectangle) outputPaths)
+        {
+            try
+            {
+                if (!File.Exists(file))
                 {
-                    _ = Task.WhenAll(
-                        //DetectAndSaveCompositeImageAsync(sourceImagePath, outputPaths.Composite),
-                        DetectAndSaveCircleImageAsync(sourceImagePath, outputPaths.Circle),
-                        DetectAndSaveRectangleImageAsync(sourceImagePath, outputPaths.Rectangle)
-                    );
+                    return false;
                 }
+
+                Debug.WriteLine($"[ProcessSingleImageFile] 直接ファイル処理: {file}");
+                ExecuteDetectionTasks(file, outputPaths);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ProcessSingleImageFile] 直接ファイル処理失敗 '{file}': {ex.Message}");
+                return false;
             }
         }
 
-        private (string Composite, string Circle, string Rectangle) GenerateOutputPaths(string folderPath, string baseFileName)
+        /// <summary>
+        /// データベース経由でファイルを検索して処理
+        /// </summary>
+        private void ProcessFileViaDatabase(
+            string file,
+            string fileNameWithoutExtension,
+            (string Composite, string Circle, string Rectangle) outputPaths,
+            DatabaseHelper db)
         {
-            return (
-                Composite: Path.Combine(folderPath, baseFileName + TrainingDataSuffix),
-                Circle: Path.Combine(folderPath, baseFileName + CircleDetectionSuffix),
-                Rectangle: Path.Combine(folderPath, baseFileName + RectangleDetectionSuffix)
-            );
+            var searchKey = ExtractSearchKey(fileNameWithoutExtension);
+            if (string.IsNullOrEmpty(searchKey))
+            {
+                Debug.WriteLine($"[ProcessSingleImageFile] 検索キーが抽出できません: {file}");
+                return;
+            }
+
+            var sourceImagePath = FindImagePathInDatabase(searchKey, db);
+            if (string.IsNullOrEmpty(sourceImagePath))
+            {
+                Debug.WriteLine($"[ProcessSingleImageFile] DB検索結果なし: {searchKey}");
+                return;
+            }
+
+            if (!File.Exists(sourceImagePath))
+            {
+                Debug.WriteLine($"[ProcessSingleImageFile] DB検索結果のファイルが存在しません: {sourceImagePath}");
+                return;
+            }
+
+            Debug.WriteLine($"[ProcessSingleImageFile] DB経由で処理: {sourceImagePath}");
+            ExecuteDetectionTasks(sourceImagePath, outputPaths);
         }
 
-        private string ExtractSearchKey(string fileName)
+        /// <summary>
+        /// データベースから画像パスを検索
+        /// </summary>
+        /// <param name="searchKey">検索キー</param>
+        /// <param name="db">データベースヘルパー</param>
+        /// <returns>見つかった画像のフルパス。見つからない場合はnull</returns>
+        private string? FindImagePathInDatabase(string searchKey, DatabaseHelper db)
         {
-            var index = fileName.IndexOf('_');
-            if (index < 0)
-                return fileName;
+            try
+            {
+                var parameters = new Dictionary<string, object>
+                {
+                    { "@param", $"%{searchKey}%" }
+                };
 
-            return index < fileName.Length - 1
-                ? fileName.Substring(index + 1)
-                : string.Empty;
+                var dataTable = db.ExecuteQuery(
+                    "SELECT フルパス FROM ScreenshotList WHERE フルパス LIKE @param",
+                    parameters);
+
+                if (dataTable?.Rows.Count == 1)
+                {
+                    return dataTable.Rows[0]["フルパス"]?.ToString();
+                }
+
+                if (dataTable?.Rows.Count > 1)
+                {
+                    Debug.WriteLine($"[FindImagePathInDatabase] 複数の結果が見つかりました: {searchKey} ({dataTable.Rows.Count}件)");
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[FindImagePathInDatabase] DB検索エラー '{searchKey}': {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 出力ファイルパス群を生成
+        /// </summary>
+        /// <param name="folderPath">出力先フォルダパス</param>
+        /// <param name="fileNameWithoutExtension">拡張子なしファイル名</param>
+        /// <returns>複合画像・円検出・矩形検出の出力パス</returns>
+        private (string Composite, string Circle, string Rectangle) GenerateOutputPaths(string folderPath, string fileNameWithoutExtension)
+        {
+            var composite = Path.Combine(folderPath, fileNameWithoutExtension + TrainingDataSuffix);
+            var circle = Path.Combine(folderPath, fileNameWithoutExtension + CircleDetectionSuffix);
+            var rectangle = Path.Combine(folderPath, fileNameWithoutExtension + RectangleDetectionSuffix);
+            return (composite, circle, rectangle);
+        }
+
+        /// <summary>
+        /// ファイル名から検索キーを抽出
+        /// </summary>
+        /// <param name="fileNameWithoutExtension">拡張子なしファイル名</param>
+        /// <returns>検索キー</returns>
+        private string? ExtractSearchKey(string fileNameWithoutExtension)
+        {
+            if (string.IsNullOrEmpty(fileNameWithoutExtension))
+                return null;
+
+            // サフィックスを除去して検索キーを抽出
+            var suffixes = new[] { TrainingDataSuffix, CircleDetectionSuffix, RectangleDetectionSuffix };
+            foreach (var suffix in suffixes)
+            {
+                var suffixWithoutExt = Path.GetFileNameWithoutExtension(suffix);
+                if (fileNameWithoutExtension.EndsWith(suffixWithoutExt, StringComparison.OrdinalIgnoreCase))
+                {
+                    return fileNameWithoutExtension.Substring(0, fileNameWithoutExtension.Length - suffixWithoutExt.Length);
+                }
+            }
+
+            // サフィックスがない場合はそのまま返す
+            return fileNameWithoutExtension;
+        }
+
+        /// <summary>
+        /// 検出タスクを実行（円・矩形検出）
+        /// </summary>
+        private void ExecuteDetectionTasks(
+            string sourceImagePath,
+            (string Composite, string Circle, string Rectangle) outputPaths)
+        {
+            try
+            {
+                // 非同期タスクを並列実行（結果は待機しない）
+                // 注: 必要に応じてタスク完了を待機する実装に変更可能
+                //_ = Task.WhenAll(
+                //DetectAndSaveCompositeImageAsync(sourceImagePath, outputPaths.Composite),
+                //DetectAndSaveCircleImageAsync(sourceImagePath, outputPaths.Circle)
+                //DetectAndSaveRectangleImageAsync(sourceImagePath, outputPaths.Rectangle)
+                //);
+                _ = DetectAndSaveCircleImageAsync(sourceImagePath, outputPaths.Circle);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ExecuteDetectionTasks] タスク実行エラー '{sourceImagePath}': {ex.Message}");
+                throw;
+            }
         }
 
         private void AddNetworkShare(string path)
