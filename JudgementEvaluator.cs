@@ -79,20 +79,24 @@ namespace ImageJudgement2
             if (string.IsNullOrEmpty(fullPath))
                 return null;
 
-            // 「不合格」が含まれていればNG（優先度高）
-            if (fullPath.Contains(FAIL_KEYWORD_JP, StringComparison.OrdinalIgnoreCase))
+            var pathDir = Path.GetDirectoryName(fullPath);
+			if (string.IsNullOrEmpty(pathDir))
+                return null;
+
+			// 「不合格」が含まれていればNG（優先度高）
+			if (pathDir.Contains(FAIL_KEYWORD_JP, StringComparison.OrdinalIgnoreCase))
                 return NG_LABEL;
 
             // 「合格」が含まれていればOK
-            if (fullPath.Contains(PASS_KEYWORD_JP, StringComparison.OrdinalIgnoreCase))
+            if (pathDir.Contains(PASS_KEYWORD_JP, StringComparison.OrdinalIgnoreCase))
                 return OK_LABEL;
 
             // "NG"が含まれていればNG
-            if (fullPath.Contains(NG_LABEL, StringComparison.OrdinalIgnoreCase))
+            if (pathDir.Contains(NG_LABEL, StringComparison.OrdinalIgnoreCase))
                 return NG_LABEL;
 
             // "OK"が含まれていればOK
-            if (fullPath.Contains(OK_LABEL, StringComparison.OrdinalIgnoreCase))
+            if (pathDir.Contains(OK_LABEL, StringComparison.OrdinalIgnoreCase))
                 return OK_LABEL;
 
             // どれも含まれていなければnull（判定不要）

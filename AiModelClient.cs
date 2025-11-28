@@ -441,14 +441,16 @@ namespace ImageJudgement2
             if (AllClassResults == null || AllClassResults.Count == 0) return 0;
 
             int sum = 0;
-            int index = 1; // 1-based ranking
+            int top = 20;
             foreach (var r in AllClassResults)
             {
-                if (!string.IsNullOrEmpty(r.CategoryName) && r.CategoryName.ToUpper().Contains(keyword.ToUpper()))
+                if(top < 0) break;
+
+				if (!string.IsNullOrEmpty(r.CategoryName) && r.CategoryName.ToUpper().Contains(keyword.ToUpper()))
                 {
-                    sum += index;
+                    sum += (int)Math.Pow(top,2);
                 }
-                index++;
+                top--;
             }
 
             return sum;
@@ -551,13 +553,15 @@ namespace ImageJudgement2
                 return TopClassResult.CategoryName.Length >= 2
                     ? TopClassResult.CategoryName.Substring(0, 2)
                     : TopClassResult.CategoryName;
+            
+            SortAllByScoreDescending();
 
-            int okScore = ComputeOkRankingScore();
+			int okScore = ComputeOkRankingScore();
             int ngScore = ComputeNgRankingScore();
 
-            if (okScore < ngScore)
+            if (okScore > ngScore)
                 return "OK";
-            else if (ngScore < okScore)
+            else if (ngScore > okScore)
                 return "NG";
             else
                 return "Unknown";
